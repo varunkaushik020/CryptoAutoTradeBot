@@ -1,6 +1,22 @@
 import axios from "axios";
 
-const BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+const CONFIGURED = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+
+// Keep the configured PORT, but inherit the hostname the page was actually opened on.
+// Windows resolves "localhost" to ::1 before 127.0.0.1, and on this machine
+// wslrelay.exe holds [::1]:8000 and resets every connection — so a hard-coded
+// localhost here leaves the dashboard rendering with no data whenever the page is
+// opened on 127.0.0.1. Inheriting the hostname means the API is reachable however you
+// got here: localhost, 127.0.0.1, or the machine's LAN IP.
+const BASE = (() => {
+  if (typeof window === "undefined") return CONFIGURED;   // SSR: nothing to inherit
+  try {
+    const port = new URL(CONFIGURED).port || "8000";
+    return `${window.location.protocol}//${window.location.hostname}:${port}`;
+  } catch {
+    return CONFIGURED;
+  }
+})();
 
 export const api = axios.create({ baseURL: BASE, timeout: 12000 });
 

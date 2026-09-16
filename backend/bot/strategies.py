@@ -33,6 +33,12 @@ class StrategyId(str, Enum):
     IFVG = "IFVG"
     SMC = "SMC"
     MACD = "MACD"
+    VOL_SQUEEZE_BREAKOUT = "VOL_SQUEEZE_BREAKOUT"
+    DIVERGENCE = "DIVERGENCE"
+    # Crypto-native, shadow-mode-validated (see config.shadow_strategies): these cast
+    # real votes only once promoted into the live `strategies` CSV.
+    FUNDING_BIAS = "FUNDING_BIAS"
+    ORDERBOOK_IMBALANCE = "ORDERBOOK_IMBALANCE"
 
 
 @dataclass
@@ -66,6 +72,10 @@ LABELS: dict[StrategyId, str] = {
     StrategyId.IFVG: "Inversion Fair Value Gap (LuxAlgo)",
     StrategyId.SMC: "Smart Money Concepts (structure/liquidity/OB)",
     StrategyId.MACD: "MACD (12/26/9)",
+    StrategyId.VOL_SQUEEZE_BREAKOUT: "Volatility Squeeze Breakout (BB/KC)",
+    StrategyId.DIVERGENCE: "RSI/Price Divergence",
+    StrategyId.FUNDING_BIAS: "Funding Rate Bias (contrarian, shadow)",
+    StrategyId.ORDERBOOK_IMBALANCE: "Order-Book Imbalance (shadow)",
 }
 
 
@@ -235,6 +245,68 @@ def _smc(ctx: StrategyContext) -> Signal:
     return Signal(Action.NEUTRAL)
 
 
+@register(StrategyId.VOL_SQUEEZE_BREAKOUT)
+def _vol_squeeze_breakout(ctx: StrategyContext) -> Signal:
+    """TTM-style squeeze release: votes the breakout direction the instant a BB-
+    inside-KC volatility squeeze lets go, scaled up by ADX (a stronger trend behind
+    the release earns more conviction)."""
+    sig = ctx.ind.get("squeeze_signal")
+    if sig not in ("RELEASE_UP", "RELEASE_DOWN"):
+        return Signal(Action.NEUTRAL)
+    adx = ctx.ind.get("adx") or 0
+    strength = 1.0 + min(adx, 40) / 40 * 0.5
+    if sig == "RELEASE_UP":
+        return Signal(Action.BUY, f"Volatility squeeze released up (ADX {adx:.0f})", strength)
+    return Signal(Action.SELL, f"Volatility squeeze released down (ADX {adx:.0f})", strength)
+
+
+@register(StrategyId.DIVERGENCE)
+def _divergence(ctx: StrategyContext) -> Signal:
+    """RSI/price divergence at swing points. Regular divergence votes the reversal
+    direction; hidden divergence votes trend continuation. Only a FRESH divergence
+    (confirmed at/near the latest bar) casts a vote — a stale one is not a signal."""
+    d = ctx.extra.get("divergence")
+    latest = (d or {}).get("latest")
+    if not latest or not latest.get("fresh"):
+        return Signal(Action.NEUTRAL)
+    label = f"{latest.get('kind')} {latest.get('dir')} RSI divergence"
+    if latest.get("dir") == "bullish":
+        return Signal(Action.BUY, label)
+    if latest.get("dir") == "bearish":
+        return Signal(Action.SELL, label)
+    return Signal(Action.NEUTRAL)
+
+
+@register(StrategyId.FUNDING_BIAS)
+def _funding_bias(ctx: StrategyContext) -> Signal:
+    """Contrarian fade of extreme perpetual funding: crowded longs paying heavily
+    tend to unwind, and vice versa. SHADOW-mode by default (config.shadow_strategies)
+    — tracked on a side ledger until it proves positive expectancy live."""
+    f = ctx.extra.get("funding")
+    extreme = (f or {}).get("extreme")
+    rate = (f or {}).get("funding_rate")
+    if extreme == "high":
+        return Signal(Action.SELL, f"Funding extremely high ({rate}) — crowded longs, fade")
+    if extreme == "low":
+        return Signal(Action.BUY, f"Funding extremely low ({rate}) — crowded shorts, fade")
+    return Signal(Action.NEUTRAL)
+
+
+@register(StrategyId.ORDERBOOK_IMBALANCE)
+def _orderbook_imbalance(ctx: StrategyContext) -> Signal:
+    """Short-horizon L2 book bid/ask volume skew. SHADOW-mode by default (config.
+    shadow_strategies) — a seconds-scale signal cast at low conviction given the
+    horizon mismatch with the 15m decision cadence it would otherwise vote into."""
+    ob = ctx.extra.get("orderbook_imbalance")
+    sig = (ob or {}).get("signal")
+    imb = (ob or {}).get("imb")
+    if sig == "BUY":
+        return Signal(Action.BUY, f"Order book bid-heavy (imbalance {imb:+.2f})", 0.5)
+    if sig == "SELL":
+        return Signal(Action.SELL, f"Order book ask-heavy (imbalance {imb:+.2f})", 0.5)
+    return Signal(Action.NEUTRAL)
+
+
 # --------------------------------------------------------------------------- #
 #  Engine
 # --------------------------------------------------------------------------- #
@@ -252,13 +324,30 @@ def parse_enabled(csv: str) -> list[StrategyId]:
 
 
 def evaluate(ctx: StrategyContext, enabled: list[StrategyId], min_signals: int,
-             weights: dict | None = None) -> dict:
+             weights: dict | None = None, shadow: list[StrategyId] | None = None) -> dict:
     """
     Run every enabled strategy and aggregate votes into a decision.
     `weights` (auto-tune) scales each strategy's vote: still need `min_signals`
     distinct strategies agreeing, but the WEIGHTED score decides which side wins.
+
+    `shadow` strategies (e.g. FUNDING_BIAS, ORDERBOOK_IMBALANCE — see
+    config.shadow_strategies) are evaluated too, but returned separately as
+    `shadow_votes` and NEVER folded into buy/sell/threshold — they build a track
+    record (via autotune.record_shadow_outcome) without ever influencing a real
+    trade until promoted into `enabled`.
     """
     weights = weights or {}
+    shadow_votes: dict[str, str] = {}
+    for sid in (shadow or []):
+        if sid in enabled:
+            continue  # already a real, voting strategy — no separate shadow ledger needed
+        fn = REGISTRY.get(sid)
+        if not fn:
+            continue
+        try:
+            shadow_votes[sid.value] = fn(ctx).action.value
+        except Exception as e:
+            shadow_votes[sid.value] = Signal(Action.NEUTRAL, f"error: {e}").action.value
     votes: dict[str, str] = {}
     reasons: list[str] = []
     buy = sell = 0          # counts (for the min_signals gate)
@@ -297,6 +386,7 @@ def evaluate(ctx: StrategyContext, enabled: list[StrategyId], min_signals: int,
         "action": action.value,
         "reason": reason,
         "votes": votes,
+        "shadow_votes": shadow_votes,
         "buy_score": buy,
         "sell_score": sell,
         "buy_w": round(buy_w, 2),

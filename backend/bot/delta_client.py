@@ -184,6 +184,30 @@ class DeltaClient:
                 return resp.json().get("result") or {}
         return await self._cached(f"ticker:{symbol}", 3.0, _fetch)
 
+    async def get_funding_and_oi(self, symbol: str) -> dict:
+        """Perpetual funding rate + open interest, parsed off the SAME cached ticker
+        `get_ticker()` already fetches (3s TTL) — no extra network call.
+
+        Field names confirmed against a live testnet /v2/tickers/{symbol} response:
+        funding_rate, oi, oi_change_usd_6h, spot_price, mark_price.
+        """
+        t = await self.get_ticker(symbol)
+
+        def _f(key):
+            v = t.get(key)
+            try:
+                return float(v) if v is not None else None
+            except (TypeError, ValueError):
+                return None
+
+        return {
+            "funding_rate": _f("funding_rate"),
+            "oi": _f("oi"),
+            "oi_change_6h": _f("oi_change_usd_6h"),
+            "spot_price": _f("spot_price"),
+            "mark_price": _f("mark_price"),
+        }
+
     async def get_orderbook(self, symbol: str) -> dict:
         """L2 book: {'buy': [bids, price-descending], 'sell': [asks, price-ascending]}.
 

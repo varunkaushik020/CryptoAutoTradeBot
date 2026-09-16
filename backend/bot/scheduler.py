@@ -15,10 +15,12 @@ from datetime import datetime, timezone, timedelta
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 
-from bot.delta_client import DeltaClient
+from bot.delta_client import DeltaClient, vwap_fill
 from bot.indicators import compute_indicators
 from bot.lux_indicators import supertrend_ai, trendline_breakout_navigator, fair_value_gaps, inverse_fvg, _atr
 from bot import strategies, autotune, ai_brain, smc, edge as edge_mod, news, agents as agents_mod, ensemble
+from bot import divergence as divergence_mod, funding as funding_mod, orderbook as orderbook_mod
+from bot import portfolio_risk
 from config import settings
 from db import db
 
@@ -30,7 +32,7 @@ _delta = DeltaClient()
 _last_ai_call: dict[str, float] = {}  # symbol -> monotonic ts of last LLM fallback (cooldown)
 
 
-def _analyze(candles):
+def _analyze(candles, vwap_candles=None):
     """Compute every indicator for one timeframe."""
     ind = compute_indicators(
         candles,
@@ -39,6 +41,14 @@ def _analyze(candles):
         rsi_period=settings.rsi_period,
         rsi_oversold=settings.rsi_oversold,
         rsi_overbought=settings.rsi_overbought,
+        bb_period=settings.bb_period,
+        bb_mult=settings.bb_mult,
+        kc_period=settings.kc_period,
+        kc_atr_mult=settings.kc_atr_mult,
+        kc_atr_len=settings.kc_atr_len,
+        adx_period=settings.adx_period,
+        vwap_enabled=settings.vwap_enabled,
+        vwap_candles=vwap_candles,
     )
     st = supertrend_ai(candles)
     tn = trendline_breakout_navigator(candles, term=settings.trendline_term)
@@ -265,6 +275,59 @@ async def _daily_loss_exceeded(balance: float) -> tuple[bool, float, float]:
     return (total <= limit), round(total, 2), round(limit, 2)
 
 
+async def _liquidity_check(symbol: str, want_long: bool, lots: int = 0) -> tuple[bool, str]:
+    """Is this market tradeable right now?
+
+    Two questions, both asked BEFORE committing capital:
+      1. Is the quoted spread sane? A wide book means the entry itself is a loss.
+      2. Could we actually EXIT this size? Never enter a market you can't leave —
+         a position you can only close at a real concession is a trap, not a trade.
+    """
+    try:
+        book = await _delta.get_orderbook(symbol)
+        t = await _delta.get_ticker(symbol)
+        mark = float(t.get("mark_price") or t.get("close") or 0)
+    except Exception as e:
+        return False, f"order book unavailable ({type(e).__name__})"
+    bids, asks = book.get("buy") or [], book.get("sell") or []
+    if not bids or not asks or not mark:
+        return False, "empty order book"
+
+    bid, ask = float(bids[0]["price"]), float(asks[0]["price"])
+    spread_pct = (ask - bid) / mark * 100
+    if spread_pct > settings.max_entry_spread_pct:
+        return False, f"spread {spread_pct:.2f}% > {settings.max_entry_spread_pct:g}% (illiquid)"
+
+    if lots > 0:
+        # exiting a long sells into bids; exiting a short buys from asks
+        exit_levels = bids if want_long else asks
+        px, got = vwap_fill(exit_levels, lots)
+        if got < lots - 1e-9 or not px:
+            return False, f"book too thin to exit {lots} lots"
+        exit_slip = abs(px - mark) / mark * 100
+        if exit_slip > settings.max_exit_slippage_pct:
+            return False, (f"exit would cost {exit_slip:.2f}% "
+                           f"(> {settings.max_exit_slippage_pct:g}%) — unexitable")
+    return True, f"spread {spread_pct:.2f}%"
+
+
+async def _liquidity_gate(symbol: str, want_long: bool, lots: int = 0) -> tuple[bool, str, dict]:
+    """Wraps `_liquidity_check` with the shadow/enforce mode switch.
+
+    In "shadow" mode the check still runs and is still logged, but never blocks a
+    trade — this exists to gather real block-rate data (the testnet book, ETH's
+    especially, is sometimes empty) before ever flipping to "enforce".
+    Returns (allow_trade, status_text, log_meta).
+    """
+    if not settings.liquidity_gate_enabled or settings.liquidity_gate_mode == "off":
+        return True, "", {"mode": "off"}
+    ok, txt = await _liquidity_check(symbol, want_long, lots)
+    meta = {"mode": settings.liquidity_gate_mode, "ok": ok, "reason": txt, "lots": lots}
+    if not ok and settings.liquidity_gate_mode == "enforce":
+        return False, txt, meta
+    return True, txt, meta
+
+
 def _symbol_profile(symbol: str, big: bool) -> dict | None:
     """POINT-based SL/TP limits for symbols that use them (ETH). Returns None for
     symbols that keep the percent-based logic (e.g. BTC)."""
@@ -301,13 +364,19 @@ def _parse_iso(v):
         return datetime.now(timezone.utc)
 
 
-async def _closed_trade_realized(symbol: str, opened_at) -> float:
-    """Realized USD P/L of the just-closed trade (fills since it opened)."""
+async def _closed_trade_realized(symbol: str, opened_at) -> tuple[float, datetime | None]:
+    """Realized USD P/L of the just-closed trade, plus the time of its last fill.
+
+    The exit timestamp is what lets the trade be scored against the MARK price at the
+    moment it actually closed. With no fills we know neither number, so the caller
+    stores the row as unverified rather than guessing — a guess here is what once
+    produced 129 phantom "wins" and made the training panel lie.
+    """
     cv = await _delta.get_contract_value(symbol)
     try:
         fills = await _delta.get_fills(page_size=500)
     except Exception:
-        return 0.0
+        return 0.0, None
     rows = []
     start = _parse_iso(opened_at)
     for f in fills:
@@ -338,7 +407,102 @@ async def _closed_trade_realized(symbol: str, opened_at) -> float:
                 avg = price
             pos = new
         realized -= comm
-    return realized
+    return realized, (rows[-1][0] if rows else None)
+
+
+async def _mark_at(symbol: str, when: datetime | None) -> tuple[float, bool]:
+    """MARK price at `when`, plus whether that price really came from `when`.
+
+    Attribution must be judged on the mark price the bot actually traded around, not
+    on the fill — a thin book can put the fill percent(s) away from any real price.
+
+    The flag matters. The candle feed is always anchored to *now*, so a `when` older
+    than the window we fetch simply cannot be answered. Quietly substituting the live
+    mark there would score a trade against a price it never saw — the same shape of
+    error as the phantom "wins" this panel was built to stop. So the miss is reported
+    instead, and the caller records such a row as unverified.
+    """
+    if when is not None:
+        try:
+            # The window ends at now, so ask for enough 1m bars to actually reach back
+            # to `when` (a fixed 300 only ever covered ~5h).
+            age_min = (datetime.now(timezone.utc) - when).total_seconds() / 60
+            need = int(min(max(age_min + 10, 60), 2000))
+            candles = await _delta.get_candles(symbol, 1, need, mark=True)
+            ts = int(when.timestamp())
+            prior = [c for c in candles if c["time"] <= ts]
+            if prior:
+                return float(prior[-1]["close"]), True
+        except Exception:
+            pass
+    try:
+        t = await _delta.get_ticker(symbol)
+        # With no timestamp asked for, the live mark IS the answer; otherwise this is
+        # a fallback that does not describe `when`.
+        return float(t.get("mark_price") or t.get("close") or 0), when is None
+    except Exception:
+        return 0.0, False
+
+
+async def _record_trade_outcome(symbol: str, state: dict) -> dict:
+    """Score a just-closed trade two ways and persist both to `trade_outcomes`.
+
+    strategy R  — mark entry -> mark exit. Measures the DECISION: was the direction
+                  right? This is what trains the strategy weights.
+    execution R — real fills incl. commission. Measures the VENUE: what the book
+                  actually paid. Kept for visibility, never fed to the tuner, because
+                  an empty order book would otherwise punish correct calls.
+
+    This is the only writer of `trade_outcomes`; the /bot/training panel is a pure
+    reader of it. If this stops being called, that panel silently freezes.
+    """
+    cv = await _delta.get_contract_value(symbol)
+    realized_exec, exit_ts = await _closed_trade_realized(symbol, state.get("opened_at"))
+    entry_mark = float(state.get("entry") or 0)
+    size = abs(float(state.get("size") or 0))
+    sign = 1 if state.get("side") == "buy" else -1
+    exit_mark, exit_mark_exact = await _mark_at(symbol, exit_ts)
+
+    strategy_pnl = (exit_mark - entry_mark) * sign * size * cv if (entry_mark and exit_mark) else 0.0
+    risk_d = float(state.get("risk_dollars") or 0)
+
+    def _r(pnl: float) -> float:
+        if risk_d > 0:
+            return round(pnl / risk_d, 3)
+        return 1.0 if pnl > 0 else -1.0 if pnl < 0 else 0.0
+
+    doc = {
+        "symbol": symbol,
+        # Without fills — or without a mark price from the actual exit moment — we
+        # cannot know what happened; such rows are stored for visibility but excluded
+        # from training and from the summary figures.
+        "verified": exit_ts is not None and exit_mark_exact,
+        # Kept apart so a failure says which half went missing.
+        "fills_matched": exit_ts is not None,
+        "exit_mark_exact": exit_mark_exact,
+        "side": "BUY" if sign > 0 else "SELL",
+        "size": size,
+        "opened_at": state.get("opened_at"),
+        "closed_at": exit_ts or datetime.now(timezone.utc),
+        "entry_mark": round(entry_mark, 2),
+        "exit_mark": round(exit_mark, 2),
+        "fill_entry": state.get("fill_price"),
+        "risk_dollars": round(risk_d, 2),
+        "strategy_pnl": round(strategy_pnl, 2),
+        "execution_pnl": round(realized_exec, 2),
+        "slippage_cost": round(realized_exec - strategy_pnl, 2),
+        "strategy_r": _r(strategy_pnl),
+        "execution_r": _r(realized_exec),
+        "votes": state.get("votes") or {},
+        "sl_method": state.get("sl_method"),
+        "tp_source": state.get("tp_source"),
+        "ai_confidence": ((state.get("ai") or {}) or {}).get("confidence"),
+    }
+    try:
+        await db.trade_outcomes.insert_one(dict(doc))
+    except Exception as e:
+        logger.error(f"outcome persist failed: {e}")
+    return doc
 
 
 async def _manage_open_position(symbol: str):
@@ -352,17 +516,32 @@ async def _manage_open_position(symbol: str):
             # flat -> attribute the trade's result to its strategies, then clean up
             if state:
                 try:
-                    realized = await _closed_trade_realized(symbol, state.get("opened_at"))
-                    risk_d = float(state.get("risk_dollars") or 0)
-                    R = (realized / risk_d) if risk_d > 0 else (1.0 if realized > 0 else -1.0 if realized < 0 else 0.0)
-                    action = "BUY" if state.get("side") == "buy" else "SELL"
-                    await autotune.record_outcome(state.get("votes") or {}, action, R)
-                    # continuous learning: credit/debit the agents that drove this trade
-                    agent_ids = state.get("agents") or []
-                    if agent_ids:
-                        await ensemble.record_outcome(agent_ids, R)
-                    logger.info(f"{symbol} closed — realized ${realized:.2f} ({R:+.2f}R) → "
-                                f"attributed to {action} voters" + (f" + agents {agent_ids}" if agent_ids else ""))
+                    o = await _record_trade_outcome(symbol, state)
+                    action = o["side"]
+                    if o["verified"]:
+                        # Train on the DECISION (mark->mark), not on what a thin book paid.
+                        train_r = o["strategy_r"] if settings.autotune_use_mark_pnl else o["execution_r"]
+                        await autotune.record_outcome(state.get("votes") or {}, action, train_r)
+                        await autotune.record_shadow_outcome(state.get("shadow_votes") or {}, action, train_r)
+                        # continuous learning: credit/debit the agents that drove this trade
+                        agent_ids = state.get("agents") or []
+                        if agent_ids:
+                            await ensemble.record_outcome(agent_ids, train_r)
+                        logger.info(
+                            f"{symbol} closed — strategy {o['strategy_pnl']:+.2f} ({o['strategy_r']:+.2f}R) "
+                            f"| execution {o['execution_pnl']:+.2f} ({o['execution_r']:+.2f}R) "
+                            f"| slippage {o['slippage_cost']:+.2f} → attributed to {action} voters"
+                            + (f" + agents {agent_ids}" if agent_ids else "")
+                        )
+                    else:
+                        # No fills matched this trade: we cannot say what it did, so it
+                        # must not teach the tuner anything.
+                        why = ("no fills matched" if not o["fills_matched"]
+                               else "no mark price for the exit moment")
+                        logger.warning(
+                            f"{symbol} closed but {why} — outcome recorded "
+                            f"unverified and excluded from training."
+                        )
                 except Exception as e:
                     logger.error(f"attribution error: {e}")
                 for o in await _delta.get_live_orders(symbol):
@@ -390,9 +569,86 @@ async def _manage_open_position(symbol: str):
         logger.error(f"manage_position error: {e}")
 
 
-async def _process_symbol(symbol: str, allow_entry: bool, weights: dict | None = None):
+#: Serialises every order-placing path. bot_tick holds it for its whole run, so
+#: fast_tick can never interleave an entry with the deep tick's own execution.
+_tick_lock = asyncio.Lock()
+
+#: symbol -> {side, trigger, expires, armed_at}. Written by the deep tick when a
+#: setup looks reachable before the next one; read by fast_tick.
+_watch: dict[str, dict] = {}
+
+
+def _expected_move(c_ltf: list[dict], horizon_sec: int) -> float | None:
+    """How far price is expected to travel in `horizon_sec`, from 5m ATR.
+
+    ATR is per 5m bar, so scale it to the horizon. Used to answer the question
+    "could this trade become executable before the next deep tick?" — if the
+    trigger is further away than the market is likely to move, don't arm.
+    """
+    try:
+        series = _atr(c_ltf, settings.atr_period)   # per-bar series, newest last
+    except Exception:
+        return None
+    if not series:
+        return None
+    atr = series[-1]
+    if not atr or atr <= 0:
+        return None
+    bar_sec = max(settings.ltf_timeframe, 1) * 60
+    return float(atr) * (horizon_sec / bar_sec)
+
+
+def _update_watch(symbol: str, ai_plan: dict | None, price: float,
+                  c_ltf: list[dict], allow_entry: bool, in_position: bool) -> None:
+    """Arm/disarm the fast loop for one symbol, right after a deep analysis.
+
+    Armed only when the AI wants a direction, names an entry level we have not
+    reached, we are flat and allowed to enter, and that level is within reach at
+    current volatility. Anything else clears the watch so it cannot fire stale.
+    """
+    _watch.pop(symbol, None)
+    if not settings.fast_check_enabled or not allow_entry or in_position or not ai_plan:
+        return
+    side = ai_plan.get("action")
+    trigger = ai_plan.get("entry")
+    if side not in ("BUY", "SELL") or not trigger:
+        return
+    # Already through the level — the deep tick either took it or declined it;
+    # arming here would re-enter on analysis that has already been acted on.
+    if (side == "BUY" and price >= trigger) or (side == "SELL" and price <= trigger):
+        return
+    horizon = settings.check_interval_seconds or settings.check_interval_minutes * 60
+    reach = _expected_move(c_ltf, horizon)
+    if reach is None:
+        return
+    distance = abs(price - trigger)
+    if distance > settings.fast_arm_atr_mult * reach:
+        return
+    now = datetime.now(timezone.utc)
+    _watch[symbol] = {
+        "side": side,
+        "trigger": float(trigger),
+        "confidence": ai_plan.get("confidence"),
+        "armed_at": now,
+        "expires": now + timedelta(seconds=settings.fast_arm_ttl_sec),
+    }
+    logger.info(f"[{symbol}] fast-watch ARMED {side} @ {trigger} "
+                f"(price {price}, {distance:.2f} away, ~{reach:.2f} expected in {horizon}s)")
+
+
+def _trigger_hit(watch: dict, price: float) -> bool:
+    return ((watch["side"] == "BUY" and price >= watch["trigger"])
+            or (watch["side"] == "SELL" and price <= watch["trigger"]))
+
+
+async def _process_symbol(symbol: str, allow_entry: bool, weights: dict | None = None,
+                          fast: bool = False):
     """Manage + (optionally) trade ONE symbol. `allow_entry` gates new positions
-    so non-active symbols are still managed/closed but don't get fresh entries."""
+    so non-active symbols are still managed/closed but don't get fresh entries.
+
+    `fast=True` is the execution loop re-running this path after an armed trigger
+    was hit: identical guardrails and order code, but the AI step uses the fast
+    provider chain so the entry is not delayed by a reasoning model."""
     try:
         # 0. Manage any open position (breakeven after TP1, cleanup when flat)
         await _manage_open_position(symbol)
@@ -405,24 +661,60 @@ async def _process_symbol(symbol: str, allow_entry: bool, weights: dict | None =
             logger.warning("Not enough entry-timeframe candles yet, skipping tick.")
             return
 
+        # VWAP needs REAL trade volume — mark-price candles (the default candle
+        # source everywhere else) carry none. Fetch a parallel traded-price set just
+        # for that, and only on the deep pass (the latency-sensitive fast pass skips
+        # this extra fetch, same as it already skips historical_edge/news).
+        c_entry_vol = None
+        if settings.vwap_enabled and not fast:
+            try:
+                c_entry_vol = await _delta.get_candles(symbol, settings.entry_timeframe, settings.candle_limit, mark=False)
+            except Exception as e:
+                logger.warning(f"[{symbol}] traded-volume candles for VWAP failed: {e}")
+
         # 2. Analyze each timeframe (off the event loop — CPU-heavy)
-        (ind, st, tn, fvg, ifvg), (ind_t, st_t, tn_t, _, _), (ind_l, st_l, tn_l, _, _), smc_e, smc_t, smc_l = await asyncio.gather(
-            asyncio.to_thread(_analyze, c_entry),         # entry / decision (15m)
+        (ind, st, tn, fvg, ifvg), (ind_t, st_t, tn_t, _, _), (ind_l, st_l, tn_l, _, _), smc_e, smc_t, smc_l, divergence = await asyncio.gather(
+            asyncio.to_thread(_analyze, c_entry, c_entry_vol),  # entry / decision (15m)
             asyncio.to_thread(_analyze, c_trend),         # trend / bias (1h)
             asyncio.to_thread(_analyze, c_ltf),           # timing (5m)
             asyncio.to_thread(smc.analyze, c_entry),      # SMC read (15m)
             asyncio.to_thread(smc.analyze, c_trend),      # SMC read (1h)
             asyncio.to_thread(smc.analyze, c_ltf),        # SMC read (5m)
+            asyncio.to_thread(divergence_mod.detect_divergence, c_entry,
+                              settings.divergence_swing_left, settings.divergence_swing_right),
         )
         bias = _trend_bias(ind_t, st_t, tn_t)
         bias_txt = {1: "bullish", -1: "bearish", 0: "neutral"}[bias]
 
+        # Crypto-native shadow signals: funding-rate bias (skipped on fast passes —
+        # a slow-moving signal that doesn't need 15s-cadence history writes) and
+        # order-book imbalance (cheap; get_orderbook has its own short-TTL cache).
+        funding_read = None
+        if not fast:
+            try:
+                funding_read = await funding_mod.record_and_bias(symbol, _delta)
+            except Exception as e:
+                logger.warning(f"[{symbol}] funding read failed: {e}")
+        orderbook_read = None
+        try:
+            orderbook_read = orderbook_mod.imbalance(await _delta.get_orderbook(symbol))
+        except Exception as e:
+            logger.warning(f"[{symbol}] orderbook read failed: {e}")
+
         # 3. Entry votes on the lower timeframe (need >= min_signals)
         enabled = strategies.parse_enabled(settings.strategies)
+        shadow = strategies.parse_enabled(settings.shadow_strategies)
         ctx = strategies.StrategyContext(candles=c_entry, ind=ind, supertrend=st, trendline=tn, fvg=fvg, ifvg=ifvg,
-                                         extra={"smc": smc_e, "smc_trend": smc_t})
-        result = strategies.evaluate(ctx, enabled, settings.min_signals, weights)
+                                         extra={"smc": smc_e, "smc_trend": smc_t, "divergence": divergence,
+                                                "funding": funding_read, "orderbook_imbalance": orderbook_read})
+        result = strategies.evaluate(ctx, enabled, settings.min_signals, weights, shadow=shadow)
         entry_action = result["action"]
+
+        # ADX regime gate: in a non-trending 1h market, trend-following entries have
+        # no edge — block BOTH the mechanical vote and (below) an AI-driven decide.
+        # Off by default until backtest-validated (see GET /bot/backtest COMBINED_ADX_GATED).
+        adx_now = (ind_t or {}).get("adx")
+        adx_blocks = bool(settings.adx_gate_enabled and adx_now is not None and adx_now < settings.adx_min_trend)
 
         # 3b. Higher-TF filter: don't fight the 1h trend
         action = entry_action
@@ -432,6 +724,9 @@ async def _process_symbol(symbol: str, allow_entry: bool, weights: dict | None =
         elif entry_action == "SELL" and bias > 0:
             action = "HOLD"
             reason = f"Blocked — 15m wanted SELL but 1h trend is bullish | {result['reason']}"
+        elif entry_action in ("BUY", "SELL") and adx_blocks:
+            action = "HOLD"
+            reason = f"Blocked — 1h ADX {adx_now:.1f} < {settings.adx_min_trend:g} (ranging) | {result['reason']}"
         else:
             reason = f"1h trend {bias_txt} | {result['reason']}"
 
@@ -483,15 +778,21 @@ async def _process_symbol(symbol: str, allow_entry: bool, weights: dict | None =
                 and settings.ai_mode in ("decide", "refine", "advisory"):
             _last_ai_call[symbol] = _now
             try:
-                hist_edge = await edge_mod.get_edge(symbol)  # backtested per-strategy edge (cached ~6h)
-                news_ctx = await news.ai_context(symbol)     # cached: upcoming events + latest headlines
+                # The fast pass is confirming a level the deep pass already reasoned
+                # about, so it ships a lean snapshot: no backtested edge, no news
+                # block. That is not just speed — the full payload trips Groq's
+                # free-tier tokens-per-minute ceiling with a 413.
+                hist_edge = None if fast else await edge_mod.get_edge(symbol)
+                news_ctx = None if fast else await news.ai_context(symbol)
                 snapshot = ai_brain.build_snapshot(
                     symbol, ind["close"], c_entry, c_trend, ind, st, tn, fvg, ifvg,
                     ind_t, st_t, tn_t, bias_txt, result["votes"], weights, {},
                     smc_entry=smc_e, smc_trend=smc_t,
                     c_ltf=c_ltf, ind_l=ind_l, st_l=st_l, tn_l=tn_l, smc_ltf=smc_l,
-                    historical_edge=hist_edge, news=news_ctx)
-                ai_plan = await asyncio.to_thread(ai_brain.analyze, snapshot)
+                    historical_edge=hist_edge, news=news_ctx,
+                    divergence=divergence, funding=funding_read, orderbook=orderbook_read)
+                chain = ai_brain.FAST_PROVIDERS if fast else ai_brain.DEFAULT_PROVIDERS
+                ai_plan = await asyncio.to_thread(ai_brain.analyze, snapshot, chain)
             except Exception as e:
                 logger.error(f"[{symbol}] AI analysis failed: {e}")
 
@@ -504,6 +805,9 @@ async def _process_symbol(symbol: str, allow_entry: bool, weights: dict | None =
             ):
                 action = "HOLD"
                 reason = f"AI wanted {cand} but blocked by 1h {bias_txt} trend | {ai_plan['reasoning']}"
+            elif cand in ("BUY", "SELL") and adx_blocks:
+                action = "HOLD"
+                reason = f"AI wanted {cand} but blocked by 1h ADX {adx_now:.1f} < {settings.adx_min_trend:g} (ranging) | {ai_plan['reasoning']}"
             else:
                 action = cand
                 ai_drove = cand in ("BUY", "SELL")
@@ -534,6 +838,8 @@ async def _process_symbol(symbol: str, allow_entry: bool, weights: dict | None =
         fraction = 0.0
         rr = float(settings.risk_reward)
         price = ind["close"]
+        liq_meta = None
+        expectancy_meta = None
         if action in ("BUY", "SELL"):
             side = action.lower()
             want_long = action == "BUY"
@@ -563,6 +869,13 @@ async def _process_symbol(symbol: str, allow_entry: bool, weights: dict | None =
                         order_status = f"skipped: max {settings.max_concurrent_positions} concurrent positions open"
                         logger.info(f"{symbol} flat + {action} signal but {n_open} positions already open — skipping")
                         raise _SkipEntry()
+                    # liquidity gate (spread): a market this wide costs more to enter and
+                    # exit than the edge is worth. Shadow mode logs this without blocking.
+                    ok_liq, liq_txt, liq_meta = await _liquidity_gate(symbol, want_long)
+                    if not ok_liq:
+                        order_status = f"skipped: {liq_txt}"
+                        logger.info(f"{symbol} entry blocked — liquidity: {liq_txt}")
+                        raise _SkipEntry()
                     # news blackout: don't open a NEW trade into a high-impact release (whipsaw risk)
                     blocked, ev = await news.in_blackout()
                     if blocked:
@@ -579,6 +892,21 @@ async def _process_symbol(symbol: str, allow_entry: bool, weights: dict | None =
                         order_status = f"skipped: daily loss limit hit (today {day_pnl} <= {day_limit})"
                         logger.warning(f"{symbol} entry blocked — daily loss limit reached (today ${day_pnl} <= ${day_limit})")
                         raise _SkipEntry()
+                    # expectancy/profitability gate: only trade vote combinations that have
+                    # REAL backtested edge on this symbol (not just enough votes agreeing).
+                    expectancy_meta = await edge_mod.blended_expectancy(symbol, result["votes"], action, weights)
+                    if settings.expectancy_gate_enabled:
+                        if expectancy_meta["blended_exp"] is None:
+                            if not settings.expectancy_gate_fail_open:
+                                order_status = "skipped: expectancy gate — no qualifying backtested evidence for this vote"
+                                logger.info(f"{symbol} entry blocked — expectancy gate: no qualifying evidence")
+                                raise _SkipEntry()
+                        elif expectancy_meta["blended_exp"] < settings.expectancy_gate_min_R:
+                            order_status = (f"skipped: expectancy gate — blended {expectancy_meta['blended_exp']:+.3f}R "
+                                            f"< min {settings.expectancy_gate_min_R:+.3f}R")
+                            logger.info(f"{symbol} entry blocked — expectancy gate: "
+                                        f"{expectancy_meta['blended_exp']:+.3f}R < {settings.expectancy_gate_min_R:+.3f}R")
+                            raise _SkipEntry()
                     # "big" trade: most indicators agree -> allow a wider stop + larger
                     # target with a smaller position (special case).
                     agree = result["buy_score"] if want_long else result["sell_score"]
@@ -636,6 +964,44 @@ async def _process_symbol(symbol: str, allow_entry: bool, weights: dict | None =
                         cap_pct = settings.big_trade_capital_pct if big else settings.position_capital_pct
                         if agent_drove:
                             cap_pct *= agent_size_mult
+
+                        # Correlation-aware dampening: don't silently double correlated
+                        # exposure when another open position (different symbol, same
+                        # direction) is highly correlated with this one.
+                        corr_used = None
+                        if settings.correlation_check_enabled:
+                            try:
+                                for p in await _delta.get_positions():
+                                    other_sym = p.get("product_symbol")
+                                    other_size = float(p.get("size") or 0)
+                                    if not other_sym or other_sym == symbol or not other_size:
+                                        continue
+                                    if (other_size > 0) != want_long:
+                                        continue  # opposite direction — no correlated stacking
+                                    corr_used = await portfolio_risk.realized_correlation(
+                                        _delta, symbol, other_sym, settings.correlation_timeframe_min,
+                                        settings.correlation_lookback_bars)
+                                    if corr_used is not None and corr_used >= settings.correlation_high_threshold:
+                                        cap_pct *= settings.correlation_dampen_factor
+                                        logger.info(f"{symbol} sizing dampened {settings.correlation_dampen_factor:g}x "
+                                                    f"— {corr_used:.2f} correlated with open {other_sym} {side}")
+                                        break
+                            except Exception as e:
+                                logger.warning(f"{symbol} correlation check failed ({type(e).__name__}) — using full size")
+
+                        # Volatility-adjusted sizing: scale capital deployed inversely with
+                        # current ATR%, so risk normalizes across volatility regimes instead
+                        # of a flat capital allocation regardless of how choppy price is.
+                        vol_scalar_used = None
+                        if settings.vol_sizing_enabled and price > 0:
+                            atr_list = _atr(c_entry, settings.atr_period)
+                            atr_now = atr_list[-1] if atr_list else 0.0
+                            if atr_now > 0:
+                                atr_pct = atr_now / price * 100
+                                vol_scalar_used = min(max(settings.vol_ref_atr_pct / atr_pct,
+                                                          settings.vol_scalar_min), settings.vol_scalar_max)
+                                cap_pct *= vol_scalar_used
+
                         margin_usd = total_bal * cap_pct / 100.0
                         # respect the available-balance ceiling
                         margin_usd = min(margin_usd, avail * settings.margin_cap_pct)
@@ -649,6 +1015,15 @@ async def _process_symbol(symbol: str, allow_entry: bool, weights: dict | None =
                         strength = st_t["latest"].get("strength", 0) if st_t else 0
                         aligned = (bias > 0 and want_long) or (bias < 0 and not want_long)
                         rr = max(_rr_target(agree, strength, aligned), settings.risk_reward)
+
+                        # size-aware exit check: now that lots are known, confirm the book
+                        # could actually absorb closing this position. Shadow mode logs
+                        # this without blocking (see liq_meta on the earlier spread check).
+                        ok_exit, exit_txt, liq_meta = await _liquidity_gate(symbol, want_long, lots)
+                        if not ok_exit:
+                            order_status = f"skipped: {exit_txt}"
+                            logger.info(f"{symbol} entry blocked — {exit_txt}")
+                            raise _SkipEntry()
 
                         # 1) ENTRY (market, no bracket — we manage TP/SL ourselves)
                         order = await _delta.place_order(symbol, side, lots)
@@ -708,7 +1083,9 @@ async def _process_symbol(symbol: str, allow_entry: bool, weights: dict | None =
                             {"_id": symbol, "side": side, "size": lots, "entry": entry_ref,
                              "fill_price": fill_price,
                              "sl": sl_price, "tps": placed_tps, "rr": rr, "be_moved": False,
-                             "votes": result["votes"], "agents": agent_ids, "risk_dollars": round(risk_dollars, 4),
+                             "votes": result["votes"], "agents": agent_ids,
+                             "shadow_votes": result.get("shadow_votes") or {},
+                             "risk_dollars": round(risk_dollars, 4),
                              "sl_method": sl_method, "tp_source": tp_source, "ai": ai_meta,
                              "leverage": lev, "big_trade": big, "capital_pct": cap_pct,
                              "opened_at": datetime.now(timezone.utc)},
@@ -771,11 +1148,23 @@ async def _process_symbol(symbol: str, allow_entry: bool, weights: dict | None =
                        "take_profit": round(tp_price, 2) if tp_price else None},
             "ai": ai_meta,
             "agents": agent_meta,
+            "liquidity": liq_meta,
+            "expectancy_gate": expectancy_meta,
             "order_id": order_id,
             "order_status": order_status,
             "paper_trade": True,
         }
         await db.trade_logs.insert_one(log_doc)
+
+        # 6. Arm/disarm the fast execution loop. Only the DEEP pass arms — letting
+        # the fast pass re-arm would let one analysis fire repeatedly.
+        if not fast:
+            try:
+                held = await _delta.get_position_size(symbol)
+            except Exception:
+                held = 0
+            _update_watch(symbol, ai_plan, price, c_ltf,
+                          allow_entry=allow_entry, in_position=bool(held))
 
     except Exception as e:
         logger.exception(f"[{symbol}] process error: {e}")
@@ -805,34 +1194,115 @@ async def bot_tick():
     weights = await autotune.get_weights()  # live-tuned vote weights (cached ~30s)
     # All configured trade symbols can open NEW trades simultaneously; any other
     # symbol with a stray open position is managed (closed) but not re-entered.
-    for sym in tracked:
-        await _process_symbol(sym, allow_entry=(sym in trade_syms), weights=weights)
+    # Held for the whole pass so the fast loop cannot place an order mid-tick.
+    async with _tick_lock:
+        for sym in tracked:
+            await _process_symbol(sym, allow_entry=(sym in trade_syms), weights=weights)
+
+
+async def fast_tick():
+    """Latency loop between deep ticks.
+
+    Two jobs, both cheap:
+      1. Manage every open position on every pass, so a breakeven/cleanup move is
+         not up to 2 minutes late. Purely mechanical — no AI call.
+      2. For symbols the deep tick ARMED, compare the live price to the stored
+         trigger. Only when it is crossed does this spend an AI call, and then on
+         FAST_PROVIDERS (Groq ~1-2s) via the normal `_process_symbol` path, so
+         every guardrail — position cap, news blackout, loss limit, SL/TP sizing —
+         still applies to the entry.
+    """
+    if not settings.fast_check_enabled or not _bot_running:
+        return
+    # The deep tick is mid-flight; it owns execution right now.
+    if _tick_lock.locked():
+        return
+    async with _tick_lock:
+        try:
+            open_syms = {p["product_symbol"] for p in await _delta.get_positions()
+                         if p.get("size") and p.get("product_symbol")}
+        except Exception as e:
+            logger.error(f"fast_tick position fetch failed: {e}")
+            open_syms = set()
+        for sym in open_syms:
+            try:
+                await _manage_open_position(sym)
+            except Exception as e:
+                logger.error(f"[{sym}] fast manage failed: {e}")
+
+        now = datetime.now(timezone.utc)
+        weights = None
+        for sym, w in list(_watch.items()):
+            if now >= w["expires"]:
+                _watch.pop(sym, None)
+                logger.info(f"[{sym}] fast-watch expired without triggering")
+                continue
+            if sym in open_syms:          # filled in the meantime
+                _watch.pop(sym, None)
+                continue
+            try:
+                px = float((await _delta.get_ticker(sym)).get("mark_price") or 0)
+            except Exception as e:
+                logger.error(f"[{sym}] fast ticker fetch failed: {e}")
+                continue
+            if not px or not _trigger_hit(w, px):
+                continue
+            # Consume the watch BEFORE acting so a slow entry cannot double-fire.
+            _watch.pop(sym, None)
+            logger.info(f"[{sym}] fast-watch TRIGGERED {w['side']} @ {w['trigger']} "
+                        f"(mark {px}) — confirming on fast providers")
+            if weights is None:
+                weights = await autotune.get_weights()
+            await _process_symbol(sym, allow_entry=True, weights=weights, fast=True)
 
 
 def start_bot():
     global _bot_running
     if _bot_running:
         return {"status": "already_running"}
-    secs = settings.check_interval_seconds if settings.check_interval_seconds > 0 \
-        else settings.check_interval_minutes * 60
+    # Sub-minute cadence wins when set, so the loop can run every 30s.
+    secs = settings.check_interval_seconds
+    # A sub-minute loop is ~2,880 ticks/day. That is only affordable while the free
+    # first rung (Ox Alpha via OpenRouter) is answering; without it every tick walks
+    # down to metered/subscription providers. Warn loudly rather than silently bill.
+    if 0 < secs < 60 and not ai_brain._has_openrouter_key():
+        logger.warning(
+            f"Sub-minute cadence ({secs}s = ~{86400 // secs} ticks/day) with NO "
+            "OPENROUTER_API_KEY set — the free Ox Alpha rung is being skipped, so "
+            "every tick falls through to rate-limited, metered and subscription "
+            "providers. Set the key, or raise CHECK_INTERVAL_SECONDS."
+        )
+    trigger = (IntervalTrigger(seconds=secs) if secs > 0
+               else IntervalTrigger(minutes=settings.check_interval_minutes))
     scheduler.add_job(
         bot_tick,
-        trigger=IntervalTrigger(seconds=secs),
+        trigger=trigger,
         id="bot_tick",
         replace_existing=True,
         next_run_time=datetime.now(timezone.utc),  # run immediately on start
-        # A tick makes several exchange calls and can outlast a short interval. Never let
-        # ticks overlap or pile up: run at most one at a time, and if several are due, run
-        # just the latest. This keeps a 30s cadence safe even when a tick runs long.
+        # A tick can outlast a 30s interval (ai_timeout_sec is 150). Never stack
+        # overlapping ticks — they would double-read the book and can double-enter.
+        # Skip the backlog and run once when the previous tick finishes.
         max_instances=1,
         coalesce=True,
-        misfire_grace_time=max(10, secs),
+        misfire_grace_time=None,
     )
+    if settings.fast_check_enabled:
+        scheduler.add_job(
+            fast_tick,
+            trigger=IntervalTrigger(seconds=settings.fast_check_seconds),
+            id="fast_tick",
+            replace_existing=True,
+            max_instances=1,
+            coalesce=True,
+            misfire_grace_time=None,
+        )
     # Start the scheduler only once; subsequent start/stop just add/remove the job.
     if not scheduler.running:
         scheduler.start()
     _bot_running = True
-    logger.info(f"Bot started — checking every {secs}s.")
+    cadence = f"{secs} seconds" if secs > 0 else f"{settings.check_interval_minutes} minutes"
+    logger.info(f"Bot started — checking every {cadence}.")
     return {"status": "started"}
 
 
@@ -840,10 +1310,13 @@ def stop_bot():
     global _bot_running
     if not _bot_running:
         return {"status": "not_running"}
-    try:
-        scheduler.remove_job("bot_tick")
-    except Exception:
-        pass
+    for job_id in ("bot_tick", "fast_tick"):
+        try:
+            scheduler.remove_job(job_id)
+        except Exception:
+            pass
+    # Drop any armed watch — it must never survive a stop and fire on restart.
+    _watch.clear()
     # Leave the scheduler running (just without the job) so it can be restarted.
     _bot_running = False
     logger.info("Bot stopped.")
@@ -862,8 +1335,10 @@ def bot_status() -> dict:
     return {
         "running": _bot_running,
         "interval_minutes": settings.check_interval_minutes,
-        "interval_seconds": (settings.check_interval_seconds if settings.check_interval_seconds > 0
-                             else settings.check_interval_minutes * 60),
+        # Sub-minute cadence, when configured, is what actually drives the loop.
+        "interval_seconds": settings.check_interval_seconds or None,
+        "fast_check_seconds": settings.fast_check_seconds if settings.fast_check_enabled else None,
+        "armed": {s: {"side": w["side"], "trigger": w["trigger"]} for s, w in _watch.items()},
         "symbol": settings.trading_symbol,
         "symbols": syms,
         "next_run": (

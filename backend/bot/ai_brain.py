@@ -16,8 +16,10 @@ from __future__ import annotations
 import glob
 import json
 import logging
+import os
 import re
 import subprocess
+from datetime import datetime, timezone
 from pathlib import Path
 from shutil import which
 from typing import Optional
@@ -81,6 +83,16 @@ def _has_gemini_key() -> bool:
     return bool(k) and k != "paste-your-key-here"
 
 
+def _has_groq_key() -> bool:
+    k = (settings.groq_api_key or "").strip()
+    return bool(k) and k != "paste-your-key-here"
+
+
+def _has_openrouter_key() -> bool:
+    k = (settings.openrouter_api_key or "").strip()
+    return bool(k) and k != "paste-your-key-here"
+
+
 def claude_available() -> bool:
     """True if Claude can be reached — direct API key, or the local Claude Code CLI."""
     return _has_api_key() or find_claude_cli() is not None
@@ -139,7 +151,8 @@ def build_snapshot(symbol, price, c_entry, c_trend, ind, st, tn, fvg, ifvg,
                    ind_t, st_t, tn_t, bias_txt, votes, weights, account,
                    smc_entry=None, smc_trend=None,
                    c_ltf=None, ind_l=None, st_l=None, tn_l=None, smc_ltf=None,
-                   historical_edge=None, news=None) -> dict:
+                   historical_edge=None, news=None,
+                   divergence=None, funding=None, orderbook=None) -> dict:
     """Assemble everything the model needs to reason about the trade, including the
     deterministic Smart Money Concepts read for each timeframe (1h bias, 15m decision,
     5m timing)."""
@@ -158,6 +171,11 @@ def build_snapshot(symbol, price, c_entry, c_trend, ind, st, tn, fvg, ifvg,
             "trendline": (tn_.get("latest") if tn_ else None),
             "recent_swing_highs": _swings(candles, True)[-6:],
             "recent_swing_lows": _swings(candles, False)[-6:],
+            "bb": {"mid": _r(ind_.get("bb_mid")), "upper": _r(ind_.get("bb_upper")), "lower": _r(ind_.get("bb_lower"))},
+            "kc": {"mid": _r(ind_.get("kc_mid")), "upper": _r(ind_.get("kc_upper")), "lower": _r(ind_.get("kc_lower"))},
+            "squeeze": ind_.get("squeeze_signal"),
+            "adx": _r(ind_.get("adx"), 1),
+            "vwap": _r(ind_.get("vwap")),
         }
 
     snap = {
@@ -173,6 +191,7 @@ def build_snapshot(symbol, price, c_entry, c_trend, ind, st, tn, fvg, ifvg,
             "fvg_zones_near": _near_zones((fvg or {}).get("unmitigated"), price),
             "ifvg_zones_near": _near_zones((ifvg or {}).get("zones"), price),
             "smc": smc_entry,
+            "divergence": (divergence or {}).get("latest"),
         },
         "trend_tf": {**tf_block(c_trend, ind_t, st_t, tn_t), "smc": smc_trend},
         "strategy_votes": votes,
@@ -194,6 +213,12 @@ def build_snapshot(symbol, price, c_entry, c_trend, ind, st, tn, fvg, ifvg,
     # Real-time news + upcoming high-impact economic events (see `news` guidance in system prompt).
     if news:
         snap["news"] = news
+    # Crypto-native confluence, both optional (see `funding`/`orderbook` guidance in
+    # system prompt): perpetual funding-rate bias, and short-horizon L2 book skew.
+    if funding:
+        snap["funding"] = funding
+    if orderbook:
+        snap["orderbook"] = orderbook
     return snap
 
 
@@ -250,6 +275,21 @@ tone; `headline_tone` is the net read. If a High-impact release for a relevant c
 cleaner setup and a tighter structural stop. Let `headline_tone` GENTLY tilt conviction, but never let a \
 headline override a clean SMC read or invent a trade the structure doesn't support.
 - If there is no clean SMC setup with a reachable 2R to real liquidity, return HOLD. Be selective — no forced trades.
+- Each timeframe also carries `bb`/`kc`/`squeeze` (Bollinger/Keltner squeeze state — "SQUEEZE_ON" means volatility \
+is compressed and building, "RELEASE_UP"/"RELEASE_DOWN" means it just let go in that direction), `adx` (trend \
+strength, 0-100), and `vwap` (session volume-weighted average price, when available). Treat `adx` on trend_tf \
+below ~20 as a warning that the 1h market is ranging — trend-following reads (EMA, SuperTrend, trendline) are \
+less reliable there, so demand a cleaner SMC setup before trusting a breakout. A squeeze release in your \
+direction is supportive confluence, never a standalone reason to trade.
+- `entry_tf.divergence`, when present, is the latest RSI/price divergence at a swing point ("regular" = reversal, \
+"hidden" = trend continuation). Treat it as one more piece of confluence for or against the setup — not an \
+override of the SMC read.
+- An optional `funding` block (perpetual funding rate + open interest) may be present: `extreme` is "high" \
+(crowded longs paying heavily — mild contrarian lean against more upside), "low" (crowded shorts — mild \
+contrarian lean against more downside), or null (not extreme / not enough history). Let it gently tilt \
+conviction at most — never let it override a clean SMC setup or invent a trade the structure doesn't support.
+- An optional `orderbook` block (top-of-book bid/ask volume imbalance) may be present: it is a SECONDS-scale \
+signal, useful only the way `timing_tf` is — to sharpen entry timing — never to override the 15m decision.
 
 Respond with ONLY minified JSON (no markdown, no prose) matching exactly:
 {"action":"BUY|SELL|HOLD","confidence":0.0-1.0,"entry":<number>,"stop_loss":<number>,\
@@ -268,6 +308,99 @@ def _extract_json(text: str) -> Optional[dict]:
     try:
         return json.loads(m.group(0))
     except json.JSONDecodeError:
+        return None
+
+
+def _call_openrouter(snapshot_json: str, system: str = None, user_prefix: str = "MARKET SNAPSHOT:\n",
+                     model: str = None) -> Optional[str]:
+    """OpenRouter (OpenAI-compatible) call — Ox Alpha by default.
+
+    FIRST rung of every chain: free and 1M-context, so it carries the routine work
+    before any rate-limited, metered or subscription-backed provider is reached.
+
+    No `response_format` is sent: Ox Alpha is a stealth model whose JSON-mode
+    support is undocumented, and a 400 here would waste the free rung. The system
+    prompt already demands JSON and `_extract_json` tolerates fences/prose.
+    """
+    if not _has_openrouter_key():
+        return None
+    model = (model or settings.openrouter_model or "stealth/ox-alpha").strip()
+    url = settings.openrouter_base_url.rstrip("/") + "/chat/completions"
+    body = {
+        "model": model,
+        "temperature": 0.2,
+        "max_tokens": settings.openrouter_max_output_tokens,
+        "messages": [
+            {"role": "system", "content": system or _SYSTEM},
+            {"role": "user", "content": user_prefix + snapshot_json},
+        ],
+    }
+    try:
+        r = httpx.post(url, json=body, timeout=settings.ai_timeout_sec, headers={
+            "Authorization": f"Bearer {settings.openrouter_api_key.strip()}",
+            "HTTP-Referer": settings.openrouter_referer,
+            "X-Title": settings.openrouter_title,
+        })
+    except Exception as e:
+        logger.error(f"OpenRouter request error: {e} — trying next provider.")
+        return None
+    if r.status_code != 200:
+        # A stealth model can be withdrawn without notice; a 404 here means Ox Alpha
+        # is gone and OPENROUTER_MODEL needs repointing.
+        logger.error(f"OpenRouter {model} {r.status_code}: {r.text[:160]} — trying next provider.")
+        return None
+    try:
+        choices = r.json().get("choices") or []
+        if not choices:
+            logger.error(f"OpenRouter returned no choices: {r.text[:200]}")
+            return None
+        return choices[0].get("message", {}).get("content") or None
+    except Exception as e:
+        logger.error(f"OpenRouter parse error: {e}")
+        return None
+
+
+def _call_groq(snapshot_json: str, system: str = None, user_prefix: str = "MARKET SNAPSHOT:\n",
+               model: str = None) -> Optional[str]:
+    """Groq (OpenAI-compatible) chat call. Returns raw text, or None.
+
+    FIRST rung of every chain: fastest and cheapest, so routine ticks are absorbed
+    here before any metered or subscription-backed provider is reached.
+    """
+    if not _has_groq_key():
+        return None
+    model = (model or settings.groq_model or "openai/gpt-oss-120b").strip()
+    url = settings.groq_base_url.rstrip("/") + "/chat/completions"
+    body = {
+        "model": model,
+        "temperature": 0.2,
+        "max_tokens": settings.groq_max_output_tokens,
+        # Same contract as the Gemini rung: JSON out, so the plan parses cleanly.
+        "response_format": {"type": "json_object"},
+        "messages": [
+            {"role": "system", "content": system or _SYSTEM},
+            {"role": "user", "content": user_prefix + snapshot_json},
+        ],
+    }
+    try:
+        r = httpx.post(url, json=body, timeout=settings.ai_timeout_sec,
+                       headers={"Authorization": f"Bearer {settings.groq_api_key.strip()}"})
+    except Exception as e:
+        logger.error(f"Groq request error: {e} — trying next provider.")
+        return None
+    if r.status_code != 200:
+        # A decommissioned model 404s here — that is how this provider silently died
+        # before; name the model so the log says which one to replace.
+        logger.error(f"Groq {model} {r.status_code}: {r.text[:160]} — trying next provider.")
+        return None
+    try:
+        choices = r.json().get("choices") or []
+        if not choices:
+            logger.error(f"Groq returned no choices: {r.text[:200]}")
+            return None
+        return choices[0].get("message", {}).get("content") or None
+    except Exception as e:
+        logger.error(f"Groq parse error: {e}")
         return None
 
 
@@ -356,44 +489,165 @@ def _call_api(snapshot_json: str, system: str = None, user_prefix: str = "MARKET
         return None
 
 
-def _call_claude(prompt: str) -> Optional[str]:
+#: Anthropic credentials the CLI honours. Scrubbed before every subprocess so a
+#: stray global export can never silently redirect (or un-redirect) a call.
+_ANTHROPIC_ENV_VARS = ("ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY")
+
+
+#: (UTC date, calls made) — resets itself when the date rolls over.
+_router_spend: list = [None, 0]
+#: Same, for the personal-subscription CLI rung.
+_cli_spend: list = [None, 0]
+
+
+def _day_budget_left(counter: list, cap: int) -> bool:
+    """Shared UTC-day budget check; rolls the counter over on a new date."""
+    if cap <= 0:
+        return True
+    today = datetime.now(timezone.utc).date()
+    if counter[0] != today:
+        counter[0], counter[1] = today, 0
+    return counter[1] < cap
+
+
+def _cli_budget_left() -> bool:
+    """False once today's subscription-CLI cap is reached."""
+    return _day_budget_left(_cli_spend, settings.subscription_cli_daily_call_cap)
+
+
+def _cli_spend_record() -> None:
+    _cli_spend[1] += 1
+    cap = settings.subscription_cli_daily_call_cap
+    if cap > 0 and _cli_spend[1] == cap:
+        logger.warning(f"Subscription CLI daily cap reached ({cap} calls) — not spending "
+                       f"more of it today; falling back to the mechanical engine.")
+
+
+def _router_budget_left() -> bool:
+    """False once today's AgentRouter call cap is reached.
+
+    Every router call costs ~$0.28. On a 30-second loop that is 2,880 potential
+    calls/day, so an outage of the free rungs would drain the balance in minutes.
+    This cap turns that cliff into a soft landing: the chain simply moves on.
+    """
+    return _day_budget_left(_router_spend, settings.agentrouter_daily_call_cap)
+
+
+def _router_spend_record() -> None:
+    _router_spend[1] += 1
+    cap = settings.agentrouter_daily_call_cap
+    if cap > 0 and _router_spend[1] == cap:
+        logger.warning(f"AgentRouter daily cap reached ({cap} calls) — skipping that rung "
+                       f"until UTC midnight to protect the balance.")
+
+
+def agentrouter_available() -> bool:
+    """True if an AgentRouter token is configured, the CLI exists, and budget remains."""
+    k = (settings.agentrouter_api_key or "").strip()
+    return (bool(k) and k != "paste-your-key-here"
+            and find_claude_cli() is not None and _router_budget_left())
+
+
+def _claude_env(via_router: bool) -> dict:
+    """Build the environment for a `claude -p` subprocess.
+
+    AgentRouter is an Anthropic-compatible reseller that authenticates only
+    Claude-Code-style clients — the Python SDK is rejected outright with
+    `unauthorized_client_error`, so the CLI is the ONLY way to reach it.
+    Injecting the credentials per-subprocess (rather than globally) keeps them
+    out of the user's interactive Claude Code sessions, which stay on the
+    subscription and remain the last-resort fallback when the router sinks.
+    """
+    env = os.environ.copy()
+    for var in _ANTHROPIC_ENV_VARS:
+        env.pop(var, None)
+    if via_router:
+        key = settings.agentrouter_api_key.strip()
+        env["ANTHROPIC_BASE_URL"] = settings.agentrouter_base_url
+        env["ANTHROPIC_AUTH_TOKEN"] = key
+        env["ANTHROPIC_API_KEY"] = key
+    return env
+
+
+def _call_claude(prompt: str, via_router: bool = False) -> Optional[str]:
+    """Run the headless Claude Code CLI.
+
+    via_router=True bills AgentRouter credit; False uses the local subscription.
+    """
     cli = find_claude_cli()
     if not cli:
         logger.warning("Claude CLI not found — AI brain unavailable, falling back to mechanical engine.")
         return None
+    if via_router and not agentrouter_available():
+        return None
+    if not via_router and not settings.ai_allow_subscription_cli:
+        logger.warning("Subscription CLI is disabled (AI_ALLOW_SUBSCRIPTION_CLI=false) — "
+                       "not spending it; falling back to the mechanical engine.")
+        return None
+    if not via_router and not _cli_budget_left():
+        return None
+    label = "agentrouter" if via_router else "cli"
+    model = settings.agentrouter_model if via_router else settings.ai_model
+    if via_router:
+        _router_spend_record()
+    else:
+        _cli_spend_record()
     try:
         proc = subprocess.run(
-            [cli, "-p", "--output-format", "json", "--model", settings.ai_model],
+            [cli, "-p", "--output-format", "json", "--model", model],
             input=prompt.encode("utf-8"),
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             timeout=settings.ai_timeout_sec,
+            env=_claude_env(via_router),
         )
     except subprocess.TimeoutExpired:
-        logger.error(f"Claude CLI timed out after {settings.ai_timeout_sec}s")
+        logger.error(f"Claude CLI [{label}] timed out after {settings.ai_timeout_sec}s")
         return None
     except Exception as e:
-        logger.error(f"Claude CLI invocation error: {e}")
+        logger.error(f"Claude CLI [{label}] invocation error: {e}")
         return None
     if proc.returncode != 0:
-        logger.error(f"Claude CLI exit {proc.returncode}: {proc.stderr.decode('utf-8', 'ignore')[:300]}")
+        detail = proc.stderr.decode("utf-8", "ignore")[:300]
+        # stderr is often just a benign CLI warning (e.g. "connectors disabled")
+        # unrelated to the real failure — the actual reason usually lands in the
+        # JSON envelope on stdout instead (e.g. {"is_error":true,"result":"..."}),
+        # which was previously discarded entirely on a non-zero exit.
+        try:
+            stdout_raw = json.loads(proc.stdout.decode("utf-8", "ignore"))
+            if stdout_raw.get("is_error") and stdout_raw.get("result"):
+                detail = f"{stdout_raw['result']}" + (f" (stderr: {detail})" if detail else "")
+        except (json.JSONDecodeError, AttributeError):
+            pass
+        logger.error(f"Claude CLI [{label}] exit {proc.returncode}: {detail}")
         return None
     try:
         raw = json.loads(proc.stdout.decode("utf-8", "ignore"))
     except json.JSONDecodeError:
-        logger.error("Claude CLI returned non-JSON envelope")
+        logger.error(f"Claude CLI [{label}] returned non-JSON envelope")
         return None
     if raw.get("is_error"):
-        logger.error(f"Claude CLI reported error: {raw.get('result')}")
+        logger.error(f"Claude CLI [{label}] reported error: {raw.get('result')}")
         return None
     return raw.get("result")
 
 
-#: Trading loop: Flash (fast + cheap enough to run every 5 min), then Claude.
-DEFAULT_PROVIDERS = ("gemini", "anthropic", "cli")
-#: News brief: try Pro first for a deeper read, drop to Flash, then Claude.
-BRIEF_PROVIDERS = ("gemini-pro", "gemini", "anthropic", "cli")
-#: Claude only — no Gemini at all.
-CLAUDE_PROVIDERS = ("anthropic", "cli")
+#: Everything except the news brief (trading loop, analysis, ad-hoc prompts):
+#: Gemini Flash is the first port of call — fast and cheap enough to run every
+#: 5 minutes. Claude via AgentRouter picks up when Gemini errors or hits its
+#: daily quota; the subscription CLI is the last resort if the router sinks too.
+#: The personal Claude subscription (`cli`) is deliberately ABSENT from every chain
+#: below: the bot runs only on keys the user supplied (OpenRouter, Groq, Gemini,
+#: AgentRouter). `cli` remains implemented for manual/one-off use but nothing in
+#: the trading path routes to it, and AI_ALLOW_SUBSCRIPTION_CLI defaults to false.
+DEFAULT_PROVIDERS = ("openrouter", "groq", "gemini", "agentrouter")
+#: News brief: Ox Alpha first, then Claude via AgentRouter for a second opinion.
+BRIEF_PROVIDERS = ("openrouter", "agentrouter", "groq", "gemini-pro")
+#: Claude-family only — AgentRouter carries it, never the subscription.
+CLAUDE_PROVIDERS = ("agentrouter",)
+#: Latency-critical rung used by the fast execution loop. Ox Alpha is excluded on
+#: purpose — it is a reasoning model (~55s/call) and would defeat the whole point.
+#: Groq answers in ~1-2s; Gemini Flash is the backstop.
+FAST_PROVIDERS = ("groq", "gemini")
 
 
 def complete_json(system: str, payload: dict, user_prefix: str = "INPUT:\n",
@@ -406,13 +660,19 @@ def complete_json(system: str, payload: dict, user_prefix: str = "INPUT:\n",
     body = json.dumps(payload, separators=(",", ":"))
     for via in providers:
         try:
-            if via == "gemini":
+            if via == "openrouter":
+                raw = _call_openrouter(body, system=system, user_prefix=user_prefix)
+            elif via == "groq":
+                raw = _call_groq(body, system=system, user_prefix=user_prefix)
+            elif via == "gemini":
                 raw = _call_gemini(body, system=system, user_prefix=user_prefix)
             elif via == "gemini-pro":
                 raw = _call_gemini(body, system=system, user_prefix=user_prefix,
                                    model=settings.gemini_pro_model)
             elif via == "anthropic":
                 raw = _call_api(body, system=system, user_prefix=user_prefix)
+            elif via == "agentrouter":
+                raw = _call_claude(system + "\n\n" + user_prefix + body, via_router=True)
             elif via == "cli":
                 raw = _call_claude(system + "\n\n" + user_prefix + body)
             else:
@@ -429,22 +689,41 @@ def complete_json(system: str, payload: dict, user_prefix: str = "INPUT:\n",
     return None
 
 
-def analyze(snapshot: dict) -> Optional[dict]:
+def analyze(snapshot: dict, providers: tuple[str, ...] = DEFAULT_PROVIDERS) -> Optional[dict]:
     """
-    Ask Claude for a trade plan. Returns a sanitized dict, or None if unavailable.
+    Ask the AI for a trade plan. Returns a sanitized dict, or None if unavailable.
     Guardrail math (R:R, sizing, clamps) is enforced by the caller.
+
+    `providers` pins the chain: the deep loop uses DEFAULT_PROVIDERS (Ox Alpha
+    first), the fast execution loop passes FAST_PROVIDERS so a ripening setup is
+    confirmed in seconds rather than waiting on a reasoning model.
     """
     snap_json = json.dumps(snapshot, separators=(",", ":"))
-    # Gemini first; Claude (API, then local CLI) is the fallback when Gemini fails,
-    # errors, or is rate-limited.
-    result = _call_gemini(snap_json)
-    via = "gemini"
-    if result is None:
-        result = _call_api(snap_json)
-        via = "anthropic"
-    if result is None:
-        result = _call_claude(_SYSTEM + "\n\nMARKET SNAPSHOT:\n" + snap_json)
-        via = "cli"
+    # Walk the given chain so ordering has ONE definition (see the constants).
+    # The fast execution loop passes FAST_PROVIDERS to skip slow reasoning models.
+    prompt = _SYSTEM + "\n\nMARKET SNAPSHOT:\n" + snap_json
+    result, via = None, None
+    for provider in providers:
+        if provider == "openrouter":
+            result = _call_openrouter(snap_json)
+        elif provider == "groq":
+            result = _call_groq(snap_json)
+        elif provider == "gemini":
+            result = _call_gemini(snap_json)
+        elif provider == "gemini-pro":
+            result = _call_gemini(snap_json, model=settings.gemini_pro_model)
+        elif provider == "anthropic":
+            result = _call_api(snap_json)
+        elif provider == "agentrouter":
+            result = _call_claude(prompt, via_router=True)
+        elif provider == "cli":
+            result = _call_claude(prompt)
+        else:
+            logger.warning(f"unknown provider '{provider}' — skipping")
+            continue
+        if result is not None:
+            via = provider
+            break
     if result is None:
         return None
     plan = _extract_json(result)

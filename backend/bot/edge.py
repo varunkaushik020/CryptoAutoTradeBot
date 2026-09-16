@@ -47,3 +47,36 @@ async def get_edge(symbol: str) -> dict:
     except Exception as e:
         logger.error(f"[{sym}] edge compute failed: {e}")
         return cached[1] if cached else {}
+
+
+async def blended_expectancy(symbol: str, votes: dict, action: str, weights: dict | None = None) -> dict:
+    """Weight-average the backtested expectancy/PF of every strategy that voted
+    `action`, using only strategies with enough backtested trades to trust.
+
+    This is the evidence behind the pre-trade "is this actually profitable" gate —
+    it reuses the same cached backtested edge the AI snapshot already trusts,
+    rather than inventing a second notion of what "works" means.
+    """
+    weights = weights or {}
+    edge = await get_edge(symbol)
+    w_sum = exp_sum = pf_sum = 0.0
+    qualifying = []
+    for sid, vote in (votes or {}).items():
+        if vote != action:
+            continue
+        e = edge.get(sid)
+        if not e or e.get("n", 0) < settings.expectancy_gate_min_strategy_n:
+            continue
+        w = weights.get(sid, 1.0)
+        w_sum += w
+        exp_sum += w * e.get("exp", 0.0)
+        pf_sum += w * e.get("pf", 0.0)
+        qualifying.append(sid)
+    if w_sum <= 0:
+        return {"blended_exp": None, "blended_pf": None, "n_strategies": 0, "qualifying": []}
+    return {
+        "blended_exp": round(exp_sum / w_sum, 4),
+        "blended_pf": round(pf_sum / w_sum, 3),
+        "n_strategies": len(qualifying),
+        "qualifying": qualifying,
+    }

@@ -1,0 +1,57 @@
+# Pull-based deploy compose file — for GCP (or any host that isn't your dev machine).
+#
+# Unlike docker-compose.yml (which builds from local source and bind-mounts it for
+# hot-reload), this pulls the pre-built images already pushed to Docker Hub. Not
+# auto-merged with docker-compose.override.yml — it's a differently-named file, so
+# Compose only uses it when you pass -f explicitly:
+#
+#   docker compose -f docker-compose.prod.yml pull
+#   docker compose -f docker-compose.prod.yml up -d
+#
+# Re-running both of those is the "pull again and again" loop: `pull` fetches
+# whatever now sits under the *-latest tag, `up -d` recreates any container whose
+# image actually changed.
+#
+# Needs a .env file next to this one on the host (same as docker-compose.yml) —
+# copy it there directly (scp), never via git.
+
+services:
+  mongodb:
+    image: mongo:7
+    container_name: forex_mongo
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo_data:/data/db
+    environment:
+      MONGO_INITDB_DATABASE: forexbot
+    restart: unless-stopped
+
+  backend:
+    image: prabhatk850/forexbot:backend-latest
+    container_name: forex_backend
+    ports:
+      - "8000:8000"
+    depends_on:
+      - mongodb
+    env_file:
+      - .env
+    # Mongo Atlas is reached over mongodb+srv, so every connection needs working
+    # SRV/A lookups. Docker's default forwarder can drop them intermittently —
+    # pin public resolvers instead (same fix as docker-compose.yml).
+    dns:
+      - 1.1.1.1
+      - 8.8.8.8
+    restart: unless-stopped
+
+  frontend:
+    image: prabhatk850/forexbot:frontend-latest
+    container_name: forex_frontend
+    ports:
+      - "4000:4000"
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+volumes:
+  mongo_data:

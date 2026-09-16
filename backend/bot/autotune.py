@@ -82,3 +82,42 @@ async def status() -> dict:
             for sid in strategies.StrategyId
         ],
     }
+
+
+async def record_shadow_outcome(shadow_votes: dict, action: str, r_multiple: float):
+    """Same idea as record_outcome(), but on a side ledger (db.shadow_strategy_perf)
+    that never feeds get_weights() — shadow strategies (config.shadow_strategies)
+    build a real track record against realized trade R-multiples without ever
+    being able to influence a live decision."""
+    if not shadow_votes:
+        return
+    for sid, vote in shadow_votes.items():
+        if vote == action:
+            await db.shadow_strategy_perf.update_one(
+                {"_id": sid},
+                {"$inc": {"count": 1, "sum_r": float(r_multiple), "wins": 1 if r_multiple > 0 else 0}},
+                upsert=True,
+            )
+
+
+async def shadow_status() -> dict:
+    """Performance of shadow-only strategies — the evidence used to decide whether
+    to promote one into the live, voting `strategies` CSV."""
+    out = []
+    async for d in db.shadow_strategy_perf.find({}):
+        c = d.get("count", 0)
+        sid = d["_id"]
+        try:
+            enum_id = strategies.StrategyId(sid)
+        except ValueError:
+            enum_id = None
+        out.append({
+            "id": sid,
+            "label": strategies.LABELS.get(enum_id, sid) if enum_id else sid,
+            "count": c,
+            "sum_r": round(d.get("sum_r", 0.0), 2),
+            "wins": d.get("wins", 0),
+            "win_rate": round(d.get("wins", 0) / c * 100, 1) if c else 0,
+            "expectancy": round(d.get("sum_r", 0.0) / c, 3) if c else 0,
+        })
+    return {"shadow_strategies": settings.shadow_strategies, "strategies": out}

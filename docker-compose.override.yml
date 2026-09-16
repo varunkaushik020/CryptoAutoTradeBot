@@ -29,7 +29,11 @@ services:
       - /app/node_modules
       - /app/.next
     environment:
-      - NEXT_PUBLIC_API_URL=http://localhost:8000
+      # 127.0.0.1, not localhost. This value is inlined into the BROWSER bundle, and
+      # Windows resolves "localhost" to ::1 first — where wslrelay.exe holds the port
+      # and resets every connection, so the dashboard loads but no data ever arrives.
+      # Pinning IPv4 sidesteps that relay entirely.
+      - NEXT_PUBLIC_API_URL=http://127.0.0.1:8000
       # Bind mounts on Windows don't deliver inotify events into the container,
       # so the dev server has to poll to notice file changes.
       - WATCHPACK_POLLING=true

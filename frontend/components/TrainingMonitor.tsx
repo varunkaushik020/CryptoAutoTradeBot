@@ -1,7 +1,7 @@
 "use client";
 import { useEffect, useState } from "react";
 import { getTraining } from "../lib/api";
-import { GraduationCap, ShieldCheck, Ban, Info, ChevronDown, ChevronUp } from "lucide-react";
+import { GraduationCap, ShieldCheck, Ban, Info, ChevronDown, ChevronUp, AlertTriangle } from "lucide-react";
 import clsx from "clsx";
 
 interface Trade {
@@ -24,6 +24,9 @@ const when = (iso: string) =>
 
 const PAGE = 8;      // rows appended each time the list is scrolled to the bottom
 const PREVIEW = 3;   // rows shown while collapsed
+// Past this, "no recent trades" stops being a plausible quiet market and starts
+// looking like the outcome recorder has stopped writing.
+const STALE_AFTER_DAYS = 3;
 
 export default function TrainingMonitor() {
   const [d, setD] = useState<any>(null);
@@ -79,6 +82,30 @@ export default function TrainingMonitor() {
         )}
       </div>
 
+      {/* The figures below are only as fresh as the recorder that writes them. Age is
+          shown so a stopped writer reads as "stale", not as a calm month. */}
+      {s?.stale_days != null && s.stale_days > STALE_AFTER_DAYS && (
+        <div className="flex items-start gap-2 text-[11px] bg-amber-500/10 border border-amber-500/30 rounded-lg px-3 py-2 text-amber-300">
+          <AlertTriangle size={12} className="mt-0.5 shrink-0" />
+          <span>
+            Newest scored trade is <b>{s.stale_days} days old</b>. If positions have closed
+            since then, they are not being recorded — the figures below describe an older
+            period, not the present one.
+          </span>
+        </div>
+      )}
+
+      {(s?.unverified_excluded ?? 0) > 0 && (
+        <div className="flex items-start gap-2 text-[11px] bg-[#0d1117] border border-[#30363d] rounded-lg px-3 py-2 text-gray-500">
+          <AlertTriangle size={12} className="mt-0.5 shrink-0 text-gray-600" />
+          <span>
+            <b className="text-gray-400">{s.unverified_excluded}</b> closed trade(s) had no
+            matching fills, so they could not be scored and are excluded from every figure
+            here — and from training.
+          </span>
+        </div>
+      )}
+
       {/* Decision quality vs venue cost — the whole point of the split */}
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
         {[
@@ -88,7 +115,9 @@ export default function TrainingMonitor() {
             color: (s?.execution_pnl ?? 0) >= 0 ? "text-green-400" : "text-red-400" },
           { label: "Slippage cost", value: s ? usd(s.slippage_cost) : "—", hint: "lost to the order book",
             color: (s?.slippage_cost ?? 0) >= 0 ? "text-gray-300" : "text-amber-400" },
-          { label: "Decision win rate", value: s ? `${s.strategy_win_rate}%` : "—", hint: `${s?.trades ?? 0} closed trades`,
+          { label: "Decision win rate", value: s ? `${s.strategy_win_rate}%` : "—",
+            hint: s?.stale_days != null ? `${s.trades} trades · newest ${s.stale_days}d ago`
+                                        : `${s?.trades ?? 0} closed trades`,
             color: "text-gray-200" },
         ].map((c) => (
           <div key={c.label} className="bg-[#0d1117] border border-[#30363d] rounded-lg p-3">

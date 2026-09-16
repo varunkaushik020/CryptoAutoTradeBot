@@ -1,10 +1,14 @@
 """
-Technical indicators: EMA Crossover, RSI, Trendline Breakout.
+Technical indicators: EMA Crossover, RSI, Trendline Breakout, MACD, Bollinger/
+Keltner squeeze, ADX, VWAP.
 All functions accept a list of OHLCV dicts from Delta Exchange.
 """
+from datetime import datetime, timezone
 import numpy as np
 import pandas as pd
-from typing import TypedDict
+from typing import Optional, TypedDict
+
+from bot.lux_indicators import _atr
 
 
 class IndicatorResult(TypedDict):
@@ -20,6 +24,22 @@ class IndicatorResult(TypedDict):
     macd_hist: float
     macd_signal: str       # "BULLISH_CROSS" | "BEARISH_CROSS" | "BULLISH" | "BEARISH" | "NEUTRAL"
     close: float
+    bb_mid: float | None
+    bb_upper: float | None
+    bb_lower: float | None
+    kc_mid: float | None
+    kc_upper: float | None
+    kc_lower: float | None
+    squeeze_on: bool
+    squeeze_signal: str     # "SQUEEZE_ON" | "RELEASE_UP" | "RELEASE_DOWN" | "NEUTRAL"
+    adx: float | None
+    plus_di: float | None
+    minus_di: float | None
+    vwap: float | None
+    vwap_upper1: float | None
+    vwap_lower1: float | None
+    vwap_upper2: float | None
+    vwap_lower2: float | None
 
 
 def candles_to_df(candles: list[dict]) -> pd.DataFrame:
@@ -88,6 +108,84 @@ def calc_macd(series: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9
     return macd_line, signal_line, hist
 
 
+def calc_bollinger(series: pd.Series, period: int = 20, mult: float = 2.0):
+    """Bollinger Bands: SMA mid, +/- mult*stdev bands. Returns (mid, upper, lower)."""
+    mid = series.rolling(period).mean()
+    std = series.rolling(period).std(ddof=0)
+    return mid, mid + mult * std, mid - mult * std
+
+
+def calc_keltner(df: pd.DataFrame, candles: list[dict], period: int = 20,
+                 atr_mult: float = 1.5, atr_len: int = 10):
+    """Keltner Channel: EMA mid, +/- atr_mult*ATR bands. Returns (mid, upper, lower)."""
+    mid = calc_ema(df["close"], period)
+    atr_series = pd.Series(_atr(candles, atr_len), index=df.index).astype(float)
+    return mid, mid + atr_mult * atr_series, mid - atr_mult * atr_series
+
+
+def calc_squeeze(bb_upper: pd.Series, bb_lower: pd.Series, kc_upper: pd.Series, kc_lower: pd.Series) -> pd.Series:
+    """TTM-style squeeze: True when Bollinger Bands sit fully inside the Keltner
+    Channel (volatility compressed — a breakout is building)."""
+    return (bb_upper < kc_upper) & (bb_lower > kc_lower)
+
+
+def calc_adx(df: pd.DataFrame, period: int = 14):
+    """Wilder ADX/+DI/-DI, smoothed with the same .ewm(com=period-1) convention
+    calc_rsi() already uses in this module. Returns (adx, plus_di, minus_di)."""
+    high, low, close = df["high"], df["low"], df["close"]
+    up_move = high.diff()
+    down_move = -low.diff()
+    plus_dm = up_move.where((up_move > down_move) & (up_move > 0), 0.0)
+    minus_dm = down_move.where((down_move > up_move) & (down_move > 0), 0.0)
+    prev_close = close.shift(1)
+    tr = pd.concat([high - low, (high - prev_close).abs(), (low - prev_close).abs()], axis=1).max(axis=1)
+    atr = tr.ewm(com=period - 1, adjust=False).mean()
+    safe_atr = atr.replace(0, np.nan)
+    plus_di = 100 * plus_dm.ewm(com=period - 1, adjust=False).mean() / safe_atr
+    minus_di = 100 * minus_dm.ewm(com=period - 1, adjust=False).mean() / safe_atr
+    di_sum = (plus_di + minus_di).replace(0, np.nan)
+    dx = 100 * (plus_di - minus_di).abs() / di_sum
+    adx = dx.ewm(com=period - 1, adjust=False).mean()
+    return (adx.fillna(0).clip(0, 100), plus_di.fillna(0).clip(0, 100), minus_di.fillna(0).clip(0, 100))
+
+
+def calc_vwap(candles: list[dict], anchor: str = "session") -> dict:
+    """Session-anchored (UTC day) VWAP + stdev bands, using REAL trade volume.
+
+    Delta's MARK-price candles (the bot's default candle source) carry no volume
+    (confirmed empirically: `volume` is always None on `MARK:` symbols) — passing
+    those in would silently produce a meaningless flat line. Callers must pass
+    traded-price candles (get_candles(..., mark=False)); this function also treats
+    all-zero/None volume as "no data" and returns Nones rather than guess.
+    """
+    empty = {"vwap": None, "upper1": None, "lower1": None, "upper2": None, "lower2": None}
+    if not candles:
+        return empty
+    day_keys = [datetime.fromtimestamp(int(c["time"]), tz=timezone.utc).date() for c in candles]
+    cur_day = day_keys[-1]
+    start = len(candles) - 1
+    while start > 0 and day_keys[start - 1] == cur_day:
+        start -= 1
+    seg = candles[start:]
+    seg_vols = [float(c.get("volume") or 0) for c in seg]
+    cum_vol = sum(seg_vols)
+    if cum_vol <= 0:
+        return empty
+    typical = [(c["high"] + c["low"] + c["close"]) / 3 for c in seg]
+    vwap = sum(tp * v for tp, v in zip(typical, seg_vols)) / cum_vol
+    variance = sum(v * (tp - vwap) ** 2 for tp, v in zip(typical, seg_vols)) / cum_vol
+    stdev = variance ** 0.5
+    return {
+        "vwap": round(vwap, 2),
+        "upper1": round(vwap + stdev, 2), "lower1": round(vwap - stdev, 2),
+        "upper2": round(vwap + 2 * stdev, 2), "lower2": round(vwap - 2 * stdev, 2),
+    }
+
+
+def _safe(v) -> Optional[float]:
+    return float(v) if pd.notna(v) else None
+
+
 def compute_indicators(
     candles: list[dict],
     ema_fast: int = 9,
@@ -98,6 +196,14 @@ def compute_indicators(
     macd_fast: int = 12,
     macd_slow: int = 26,
     macd_signal_len: int = 9,
+    bb_period: int = 20,
+    bb_mult: float = 2.0,
+    kc_period: int = 20,
+    kc_atr_mult: float = 1.5,
+    kc_atr_len: int = 10,
+    adx_period: int = 14,
+    vwap_enabled: bool = True,
+    vwap_candles: Optional[list[dict]] = None,
 ) -> IndicatorResult:
     df = candles_to_df(candles)
 
@@ -144,6 +250,27 @@ def compute_indicators(
     else:
         macd_signal = "NEUTRAL"
 
+    # Bollinger / Keltner squeeze
+    bb_mid, bb_upper, bb_lower = calc_bollinger(close, bb_period, bb_mult)
+    kc_mid, kc_upper, kc_lower = calc_keltner(df, candles, kc_period, kc_atr_mult, kc_atr_len)
+    squeeze_series = calc_squeeze(bb_upper, bb_lower, kc_upper, kc_lower)
+    squeeze_now = bool(squeeze_series.iloc[-1]) if pd.notna(squeeze_series.iloc[-1]) else False
+    squeeze_prev = (bool(squeeze_series.iloc[-2])
+                    if len(squeeze_series) > 1 and pd.notna(squeeze_series.iloc[-2]) else squeeze_now)
+    if squeeze_prev and not squeeze_now:
+        squeeze_signal = "RELEASE_UP" if pd.notna(bb_mid.iloc[-1]) and close.iloc[-1] > bb_mid.iloc[-1] else "RELEASE_DOWN"
+    elif squeeze_now:
+        squeeze_signal = "SQUEEZE_ON"
+    else:
+        squeeze_signal = "NEUTRAL"
+
+    # ADX trend strength
+    adx, plus_di, minus_di = calc_adx(df, adx_period)
+
+    # VWAP: needs REAL volume (mark candles carry none — see calc_vwap docstring).
+    vwap_result = calc_vwap(vwap_candles if vwap_candles is not None else candles) if vwap_enabled else {
+        "vwap": None, "upper1": None, "lower1": None, "upper2": None, "lower2": None}
+
     return IndicatorResult(
         ema_fast=float(ema_f.iloc[-1]),
         ema_slow=float(ema_s.iloc[-1]),
@@ -157,4 +284,11 @@ def compute_indicators(
         macd_hist=round(hist_v, 4),
         macd_signal=macd_signal,
         close=float(close.iloc[-1]),
+        bb_mid=_safe(bb_mid.iloc[-1]), bb_upper=_safe(bb_upper.iloc[-1]), bb_lower=_safe(bb_lower.iloc[-1]),
+        kc_mid=_safe(kc_mid.iloc[-1]), kc_upper=_safe(kc_upper.iloc[-1]), kc_lower=_safe(kc_lower.iloc[-1]),
+        squeeze_on=squeeze_now,
+        squeeze_signal=squeeze_signal,
+        adx=_safe(adx.iloc[-1]), plus_di=_safe(plus_di.iloc[-1]), minus_di=_safe(minus_di.iloc[-1]),
+        vwap=vwap_result["vwap"], vwap_upper1=vwap_result["upper1"], vwap_lower1=vwap_result["lower1"],
+        vwap_upper2=vwap_result["upper2"], vwap_lower2=vwap_result["lower2"],
     )
